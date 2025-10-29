@@ -49,17 +49,24 @@ async function getFCMToken(userId) {
 }
 
 // Helper function to send the actual FCM message
-async function sendFCM(recipientToken, payload) {
-    try {
-        const response = await admin.messaging().sendToDevice(recipientToken, payload);
-        console.log('FCM Notification sent:', response);
-        return response;
-    } catch (error) {
-        console.error('Error sending notification:', error);
-        // Handle token invalidation if needed
-        return null;
-    }
+async function sendFCM(token, payload) {
+  try {
+    const message = {
+      tokens: [token], // array of device tokens
+      notification: {
+        title: payload.notification.title,
+        body: payload.notification.body,
+      },
+      data: payload.data || {}, // optional custom data
+    };
+
+    const response = await admin.messaging().sendEachForMulticast(message);
+    console.log("✅ Notification sent successfully:", response);
+  } catch (error) {
+    console.error("❌ Error sending notification:", error);
+  }
 }
+
 
 
 app.post('/api/sendNotification', async (req, res) => {

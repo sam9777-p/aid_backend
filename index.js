@@ -63,68 +63,72 @@ async function sendFCM(recipientToken, payload) {
 
 
 app.post('/api/sendNotification', async (req, res) => {
-    const { recipientId, type, data } = req.body;
+  const { recipientId, type, data } = req.body;
 
-    if (!recipientId || !type) {
-        return res.status(400).send({ error: 'Missing recipientId or type' });
+  if (!recipientId || !type) {
+    return res.status(400).send({ error: 'Missing recipientId or type' });
+  }
+
+  try {
+    const recipientToken = await getFCMToken(recipientId);
+    if (!recipientToken) {
+      console.warn(`No FCM token found for user: ${recipientId}`);
+      return res.status(200).send({ success: false, message: 'No token' });
     }
 
-    try {
-        const recipientToken = await getFCMToken(recipientId);
+    let title = "aidKRIYA Update";
+    let body = "";
 
-        if (!recipientToken) {
-            console.warn(`No FCM token found for user: ${recipientId}`);
-            return res.status(200).send({ success: false, message: 'No token' });
-        }
-
-        // 2. Determine Notification Payload based on type
-        let title = "aidKRIYA Update";
-        let body = "A walk event occurred.";
-
-        switch (type) {
-            case 'new_request':
-                title = `New Walk Request!`;
-                body = `${data.senderName} is looking for a companion.`;
-                break;
-            case 'request_accepted':
-                title = `Walk Confirmed!`;
-                body = `${data.walkerName} accepted your request.`;
-                break;
-            case 'walk_started':
-                title = `Walk is LIVE!`;
-                body = `Your companion has started the timer.`;
-                break;
-            case 'new_message':
-                title = `New Message from Companion`; 
-                // In a real scenario, you'd fetch the sender's name from 'users' based on data.senderId
-                body = data.message;
-                break;
-            case 'request_declined':
-                title = `Request Declined`;
-                body = `Your walk request was declined.`;
-                break;
-            case 'walk_ended':
-                title = `Walk Ended`;
-                body = `The walk has concluded.`;
-                break;
-            // ... handle other types
-        }
-
-        const payload = {
-            notification: { title, body, sound: 'default' },
-            data: { ...data, type: type } // Pass relevant data to the app
-        };
-
-        // 3. Send the notification
-        await sendFCM(recipientToken, payload);
-
-        return res.status(200).send({ success: true, message: 'Notification scheduled.' });
-
-    } catch (error) {
-        console.error('Error in /api/sendNotification:', error);
-        return res.status(500).send({ error: error.message });
+    switch (type) {
+      case "walk_request":
+        title = "New Walk Request 🐾";
+        body = "Someone requested you for a walk!";
+        break;
+      case "request_accepted":
+        title = "Request Accepted ✅";
+        body = "Your walk request has been accepted!";
+        break;
+      case "walk_started":
+        title = "Walk Started 🚶";
+        body = "Your walk has just started!";
+        break;
+      case "walk_Completed":
+        title = "Walk Completed 🎉";
+        body = "Your walk has been successfully completed!";
+        break;
+      case "walk_CancelledByWalker":
+        title = "Walk Cancelled 🚫";
+        body = "Your walker cancelled the walk.";
+        break;
+      case "walk_CancelledByWanderer":
+        title = "Walk Cancelled 🚫";
+        body = "The wanderer cancelled the walk.";
+        break;
+      case "chat_message":
+        title = "New Message 💬";
+        body = data?.text || "You have a new chat message.";
+        break;
+      default:
+        body = "You have a new notification!";
     }
+
+    const payload = {
+      notification: { title, body },
+      data: {
+        type,
+        walkId: data?.walkId || '',
+        click_action: "FLUTTER_NOTIFICATION_CLICK",
+      },
+    };
+
+    const response = await sendFCM(recipientToken, payload);
+    return res.status(200).send({ success: true, response });
+  } catch (error) {
+    console.error("Error sending notification:", error);
+    return res.status(500).send({ success: false, error: error.message });
+  }
 });
+
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {

@@ -1,0 +1,4 @@
+# Environment and keys
+node_modules/
+serviceAccountKey.json
+.env

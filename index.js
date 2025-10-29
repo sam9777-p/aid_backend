@@ -3,6 +3,7 @@
 
 const express = require('express');
 const admin = require('firebase-admin');
+const Buffer = require('buffer').Buffer;
 
 // --- Initialization Logic for Service Account Key ---
 const FIREBASE_SERVICE_ACCOUNT_KEY_STRING = process.env.FIREBASE_SERVICE_ACCOUNT;
@@ -12,11 +13,20 @@ if (!FIREBASE_SERVICE_ACCOUNT_KEY_STRING) {
     process.exit(1);
 }
 
-// 1. Parse the one-line JSON string back into a JavaScript object.
-// We assume the key string is a valid JSON object.
+let jsonString;
+try {
+    // The key is Base64 encoded. Decode it first.
+    jsonString = Buffer.from(FIREBASE_SERVICE_ACCOUNT_KEY_STRING, 'base64').toString('utf8');
+    console.log("Successfully decoded Base64 key.");
+} catch (e) {
+    console.error("FATAL ERROR: Could not decode Base64 key.", e);
+    process.exit(1);
+}
+
+
 let serviceAccount;
 try {
-    serviceAccount = JSON.parse(FIREBASE_SERVICE_ACCOUNT_KEY_STRING);
+    serviceAccount = JSON.parse(jsonString);
 } catch (e) {
     console.error("FATAL ERROR: Could not parse FIREBASE_SERVICE_ACCOUNT JSON string.", e);
     process.exit(1);

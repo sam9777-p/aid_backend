@@ -1,10 +1,12 @@
 // Example Node.js Server Endpoint (External to Flutter Project)
 // File: server.js or a dedicated API route
+require('dotenv').config();
 
 const express = require('express');
 const admin = require('firebase-admin');
 const Buffer = require('buffer').Buffer;
 const schedule = require("node-schedule");
+const cors = require("cors");
 
 // --- Initialization Logic for Service Account Key ---
 const FIREBASE_SERVICE_ACCOUNT_KEY_STRING = process.env.FIREBASE_SERVICE_ACCOUNT;
@@ -42,6 +44,8 @@ admin.initializeApp({
 
 const app = express();
 app.use(express.json());
+
+app.use(cors());
 
 // Helper function to fetch user's FCM token
 async function getFCMToken(userId) {
@@ -138,102 +142,220 @@ app.post('/api/sendNotification', async (req, res) => {
 });
 
 app.post("/api/schedule-walk", async (req, res) => {
-  const { walkId, senderId, recipientId, scheduledTimestampISO } = req.body;
+    console.log(`[API] Received schedule-walk request:`, req.body);
+    
+    const { walkId, senderId, recipientId, scheduledTimestampISO } = req.body;
 
-  if (!walkId || !senderId || !recipientId || !scheduledTimestampISO) {
-    return res.status(400).send({ error: "Missing required fields." });
-  }
+    // Validation
+    if (!walkId || !senderId || !recipientId || !scheduledTimestampISO) {
+        console.error("[API] Missing required fields:", { walkId, senderId, recipientId, scheduledTimestampISO });
+        return res.status(400).send({ 
+            error: "Missing required fields.",
+            received: { walkId, senderId, recipientId, scheduledTimestampISO }
+        });
+    }
 
-  const scheduledDate = new Date(scheduledTimestampISO);
-  // Calculate timeout 5 minutes *after* scheduled start
-  const timeoutDate = new Date(scheduledDate.getTime() + 5 * 60000); 
-  const db = admin.firestore();
-
-  // --- 1. Schedule the "Activation" Job ---
-  // This job will run at the scheduledDate
-  schedule.scheduleJob(scheduledDate, async () => {
-    console.log(`[Scheduler] ACTIVATING walk: ${walkId}`);
+    let scheduledDate;
+    let timeoutDate;
+    
     try {
-      // Check if walk is still 'Accepted' (user might have cancelled)
-      const walkRef = db.collection("accepted_walks").doc(walkId);
-      const walkDoc = await walkRef.get();
+        scheduledDate = new Date(scheduledTimestampISO);
+        
+        // Validate the date
+        if (isNaN(scheduledDate.getTime())) {
+            throw new Error("Invalid date format");
+        }
+        
+        // Check if the date is in the past
+        const now = new Date();
+        if (scheduledDate < now) {
+            console.warn("[API] Warning: Scheduled date is in the past. Adjusting to current time + 1 minute.");
+            scheduledDate = new Date(now.getTime() + 60000); // Add 1 minute
+        }
+        
+        // Calculate timeout 5 minutes after scheduled start
+        timeoutDate = new Date(scheduledDate.getTime() + 5 * 60000);
+        
+        console.log(`[API] Parsed dates - Scheduled: ${scheduledDate.toISOString()}, Timeout: ${timeoutDate.toISOString()}`);
+    } catch (error) {
+        console.error("[API] Error parsing date:", error);
+        return res.status(400).send({ 
+            error: "Invalid scheduledTimestampISO format",
+            details: error.message 
+        });
+    }
 
-      if (!walkDoc.exists || walkDoc.data().status !== "Accepted") {
-        console.log(`[Scheduler] Walk ${walkId} is no longer 'Accepted'. Skipping activation.`);
-        return;
-      }
+    const db = admin.firestore();
 
-      const batch = db.batch();
-      
-      // Set activeWalkId for both users, triggering the app's UI change
-      batch.update(db.collection("users").doc(senderId), { activeWalkId: walkId });
-      batch.update(db.collection("users").doc(recipientId), { activeWalkId: walkId });
-      
-      // Mark that we've set the ID so we don't run this again
-      batch.update(walkRef, { activeWalkIdSet: true });
-      
-      await batch.commit();
-      
-      // Send notifications to both users
-      const notificationPayload = {
-        notification: {
-          title: "Walk Starting Soon!",
-          body: "Your scheduled walk is starting now. Open the app to begin.",
-        },
-        data: { type: "walk_reminder", walkId: walkId }
-      };
-      
-      // Get tokens and send (using your existing helpers)
-      const senderToken = await getFCMToken(senderId);
-      const recipientToken = await getFCMToken(recipientId);
-      
-      if (senderToken) await sendFCM(senderToken, notificationPayload);
-      if (recipientToken) await sendFCM(recipientToken, notificationPayload);
+    try {
+        // --- 1. Schedule the "Activation" Job ---
+        const activationJob = schedule.scheduleJob(scheduledDate, async () => {
+            console.log(`[Scheduler] ACTIVATING walk: ${walkId} at ${new Date().toISOString()}`);
+            try {
+                const walkRef = db.collection("accepted_walks").doc(walkId);
+                const walkDoc = await walkRef.get();
+
+                if (!walkDoc.exists) {
+                    console.log(`[Scheduler] Walk ${walkId} does not exist. Skipping activation.`);
+                    return;
+                }
+
+                const walkData = walkDoc.data();
+                
+                if (walkData.status !== "Accepted") {
+                    console.log(`[Scheduler] Walk ${walkId} status is '${walkData.status}', not 'Accepted'. Skipping activation.`);
+                    return;
+                }
+
+                // Check if already activated
+                if (walkData.activeWalkIdSet === true) {
+                    console.log(`[Scheduler] Walk ${walkId} already activated. Skipping.`);
+                    return;
+                }
+
+                const batch = db.batch();
+                
+                // Set activeWalkId for both users
+                batch.update(db.collection("users").doc(senderId), { activeWalkId: walkId });
+                batch.update(db.collection("users").doc(recipientId), { activeWalkId: walkId });
+                
+                // Mark that we've set the ID
+                batch.update(walkRef, { 
+                    activeWalkIdSet: true,
+                    activatedAt: admin.firestore.FieldValue.serverTimestamp()
+                });
+                
+                await batch.commit();
+                console.log(`[Scheduler] ✅ Successfully activated walk ${walkId}`);
+                
+                // Send notifications to both users
+                const notificationPayload = {
+                    notification: {
+                        title: "Walk Starting Soon! ⏰",
+                        body: "Your scheduled walk is starting now. Open the app to begin.",
+                    },
+                    data: { type: "walk_reminder", walkId: walkId }
+                };
+                
+                const senderToken = await getFCMToken(senderId);
+                const recipientToken = await getFCMToken(recipientId);
+                
+                if (senderToken) {
+                    await sendFCM(senderToken, notificationPayload);
+                    console.log(`[Scheduler] Notification sent to sender ${senderId}`);
+                }
+                if (recipientToken) {
+                    await sendFCM(recipientToken, notificationPayload);
+                    console.log(`[Scheduler] Notification sent to recipient ${recipientId}`);
+                }
+
+            } catch (error) {
+                console.error(`[Scheduler] ❌ Failed to activate walk ${walkId}:`, error);
+                console.error(`[Scheduler] Error stack:`, error.stack);
+            }
+        });
+
+        // --- 2. Schedule the "Timeout" Job ---
+        const timeoutJob = schedule.scheduleJob(timeoutDate, async () => {
+            console.log(`[Scheduler] CHECKING TIMEOUT for walk: ${walkId} at ${new Date().toISOString()}`);
+            try {
+                const walkRef = db.collection("accepted_walks").doc(walkId);
+                const walkDoc = await walkRef.get();
+
+                if (!walkDoc.exists) {
+                    console.log(`[Scheduler] Walk ${walkId} does not exist. No timeout needed.`);
+                    return;
+                }
+
+                const walkData = walkDoc.data();
+
+                // If walk was started, completed, or cancelled, do nothing
+                if (walkData.status !== "Accepted") {
+                    console.log(`[Scheduler] Walk ${walkId} status is '${walkData.status}'. No timeout needed.`);
+                    return;
+                }
+                
+                // If we are here, the walk was missed/not started
+                console.log(`[Scheduler] ⚠️ EXPIRING walk: ${walkId}`);
+                const batch = db.batch();
+                
+                // Update status to Expired
+                batch.update(walkRef, { 
+                    status: "Expired",
+                    expiredAt: admin.firestore.FieldValue.serverTimestamp()
+                });
+                
+                // Update in requests collection as well
+                const requestRef = db.collection("requests").doc(walkId);
+                const requestDoc = await requestRef.get();
+                if (requestDoc.exists) {
+                    batch.update(requestRef, { 
+                        status: "Expired",
+                        expiredAt: admin.firestore.FieldValue.serverTimestamp()
+                    });
+                }
+
+                // CRITICAL: Delete activeWalkId from users to return their app to normal
+                batch.update(db.collection("users").doc(senderId), {
+                    activeWalkId: admin.firestore.FieldValue.delete(),
+                });
+                batch.update(db.collection("users").doc(recipientId), {
+                    activeWalkId: admin.firestore.FieldValue.delete(),
+                });
+                
+                await batch.commit();
+                console.log(`[Scheduler] ✅ Successfully expired walk ${walkId}`);
+
+                // Optionally send expiration notifications
+                const expirationPayload = {
+                    notification: {
+                        title: "Walk Expired ⏱️",
+                        body: "Your scheduled walk was not started in time and has expired.",
+                    },
+                    data: { type: "walk_expired", walkId: walkId }
+                };
+                
+                const senderToken = await getFCMToken(senderId);
+                const recipientToken = await getFCMToken(recipientId);
+                
+                if (senderToken) await sendFCM(senderToken, expirationPayload);
+                if (recipientToken) await sendFCM(recipientToken, expirationPayload);
+
+            } catch (error) {
+                console.error(`[Scheduler] ❌ Failed to expire walk ${walkId}:`, error);
+                console.error(`[Scheduler] Error stack:`, error.stack);
+            }
+        });
+
+        // Check if jobs were scheduled successfully
+        if (!activationJob) {
+            throw new Error("Failed to schedule activation job");
+        }
+        if (!timeoutJob) {
+            throw new Error("Failed to schedule timeout job");
+        }
+
+        console.log(`[API] ✅ Walk ${walkId} scheduled successfully`);
+        console.log(`[API] - Activation scheduled for: ${scheduledDate.toISOString()}`);
+        console.log(`[API] - Timeout scheduled for: ${timeoutDate.toISOString()}`);
+        
+        res.status(200).send({ 
+            success: true, 
+            message: "Walk scheduled successfully.",
+            walkId: walkId,
+            scheduledTime: scheduledDate.toISOString(),
+            timeoutTime: timeoutDate.toISOString()
+        });
 
     } catch (error) {
-      console.error(`[Scheduler] Failed to activate walk ${walkId}:`, error);
+        console.error("[API] ❌ Error scheduling walk:", error);
+        console.error("[API] Error stack:", error.stack);
+        res.status(500).send({ 
+            success: false, 
+            error: error.message,
+            stack: process.env.NODE_ENV === 'development' ? error.stack : undefined
+        });
     }
-  });
-
-  // --- 2. Schedule the "Timeout" Job ---
-  // This job will run at the timeoutDate (5 mins after schedule)
-  schedule.scheduleJob(timeoutDate, async () => {
-    console.log(`[Scheduler] CHECKING TIMEOUT for walk: ${walkId}`);
-    try {
-      const walkRef = db.collection("accepted_walks").doc(walkId);
-      const walkDoc = await walkRef.get();
-
-      // If walk doesn't exist, or was started ('Started'), or completed/cancelled, do nothing.
-      if (!walkDoc.exists || walkDoc.data().status !== "Accepted") {
-        console.log(`[Scheduler] Walk ${walkId} already started or cancelled. No timeout needed.`);
-        return;
-      }
-      
-      // If we are here, the walk was missed.
-      console.log(`[Scheduler] EXPIRING walk: ${walkId}`);
-      const batch = db.batch();
-      
-      // Update status to Expired
-      batch.update(walkRef, { status: "Expired" });
-      batch.update(db.collection("requests").doc(walkId), { status: "Expired" });
-
-      // CRITICAL: Delete activeWalkId from users to return their app to normal
-      batch.update(db.collection("users").doc(senderId), {
-        activeWalkId: admin.firestore.FieldValue.delete(),
-      });
-      batch.update(db.collection("users").doc(recipientId), {
-        activeWalkId: admin.firestore.FieldValue.delete(),
-      });
-      
-      await batch.commit();
-
-    } catch (error) {
-      console.error(`[Scheduler] Failed to expire walk ${walkId}:`, error);
-    }
-  });
-
-  console.log(`[API] Walk ${walkId} scheduled for ${scheduledDate.toISOString()}`);
-  res.status(200).send({ success: true, message: "Walk scheduled successfully." });
 });
 
 
